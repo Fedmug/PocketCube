@@ -1,0 +1,18 @@
+version: 1
+project:
+  title: Pocket Cube
+  # description:
+  keywords: []
+  authors: []
+  exclude:
+    - "source.ipynb"
+  # bibliography: []
+site:
+  template: article-theme
+  title: Pocket Cube
+  options:
+    logo: pc_icon.png
+    favicon: pc_icon.png
+  nav: []
+  actions:
+  domains: []
