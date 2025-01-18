@@ -9,6 +9,7 @@ from sympy.combinatorics.permutations import Permutation
 import matplotlib.pyplot as plt
 from scipy.stats import spearmanr, pearsonr
 from typing import Iterable
+from santa import get_moves
 
 
 # God's number (in QTM) for Pocket Cube
@@ -16,87 +17,6 @@ N_GOD = 14
 
 # The number of all states for Pocket Cube
 N_STATES = 3674160
-
-
-def get_moves(puzzle_type: str, filepath: str) -> dict[str, list[int]]:
-    """
-    Generates moves in the format `move name` -> `permutation of states`.
-
-    Args:
-        puzzle_type: A string description of the puzzle (e.g., "cube_2/2/2", "cube_3/3/3", etc)
-
-    Returns:
-        A mapping where each key is a move (as a string, e.g. "f0", "-r1") and each value 
-        is a list of integers representing the permutation that defines the move.
-    """
-    puzzle_info_df = pd.read_csv(filepath)
-    allowed_moves_str = puzzle_info_df.loc[puzzle_info_df['puzzle_type']
-                                           == puzzle_type, 'allowed_moves'].iloc[0]
-    allowed_moves_dict = json.loads(allowed_moves_str.replace("'", '"'))
-
-    moves = {}
-    for k, mv in allowed_moves_dict.items():
-        moves[k] = mv
-
-        # Add inverse moves
-        moves["-" + k] = list(Permutation(mv) ** -1)
-
-    return moves
-
-
-def show_cube_moves(puzzle_type: str,
-                    filepath: str, move: str,
-                    show_numbers: bool = True,
-                    save_figure: bool = False):
-    """
-    Show states on cube unfolding after making move
-    """
-    moves = get_moves(puzzle_type, filepath)
-    state_size = len(moves[move])
-    target = list(range(state_size))
-    l = int(np.sqrt(state_size/6))
-    grid_height = l*3
-    grid_width = l*4
-
-    xbases = [l, l, l*2, l*3, 0, l]
-    ybases = [l*3, l*2, l*2, l*2, l*2, l]
-
-    # colors = generate_gradient_colors(N)
-    colors = ['lightgray', 'lightgreen', 'tomato',
-              'cornflowerblue', 'orange', 'yellow']
-
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-
-    for ax, mi in zip(axes, [("before", target), ("after", moves[move])]):
-        k, mv = mi
-
-        ax.set_xlim([0, grid_width])
-        ax.set_ylim([0, grid_height])
-        ax.set_xticks(range(grid_width))
-        ax.set_yticks(range(grid_height))
-
-        for face in range(6):
-            for i in range(l*l):
-                dx, dy = i % l, i//l
-                x = xbases[face] + dx
-                y = ybases[face] - dy - 1
-
-                ii = face*l*l + i
-                c = colors[mv[ii]//(l*l)]
-                # c = colors[mv[ii]]
-
-                ax.add_patch(plt.Rectangle((x, y), 1, 1, color=c))
-                if show_numbers:
-                    ax.text(x + 0.5, y + 0.5,
-                            mv[ii], ha='center', va='center', color='black')
-
-        ax.grid(True)
-        ax.set_title(k)
-        ax.tick_params(labelbottom=False, labelleft=False,
-                       labelright=False, labeltop=False)
-    if save_figure:
-        plt.savefig(f"{move}.svg")
-    plt.show()
 
 
 def row_difference(A, B: torch.tensor) -> torch.tensor:
@@ -109,6 +29,22 @@ def row_difference(A, B: torch.tensor) -> torch.tensor:
     return A[~mask[:len(A)]]
 
 
+def rowwise_pearson_correlation(A, b: torch.Tensor, eps: float = 1e-10):
+    assert len(A.shape) == 2, "A must be a 2D tensor"
+    assert len(b.shape) == 1, "b must be a 1D tensor"
+    assert A.shape[1] == b.shape[0], "The number of columns in A must match the size of b"
+
+    A_mean = A.mean(dim=1, keepdim=True)
+    A_std = A.std(dim=1, unbiased=False, keepdim=True)
+    b_mean = b.mean()
+    b_std = b.std(unbiased=False)
+
+    A_norm = (A - A_mean) / (A_std + eps)
+    b_norm = (b - b_mean) / (b_std + eps)
+
+    return (A_norm @ b_norm) / b.shape[0]
+
+
 class TensorCube:
     def __init__(self, device, puzzle_type: str = "cube_2/2/2",
                  generators: list[str] = [
@@ -118,7 +54,6 @@ class TensorCube:
         self.puzzle_type = puzzle_type
         self.generators = generators
         self.available_moves = self._moves2tensor()
-        self.state_size = self.available_moves.shape[1]
         self.states = torch.zeros(
             N_STATES, self.state_size, device=self.device, dtype=torch.int8)
         self.distances = torch.zeros(
@@ -126,10 +61,36 @@ class TensorCube:
         self.layers_pop = np.zeros(N_GOD + 1, dtype=np.int32)
         self.visit_cube_states(verbose)
         self.neighbors_tensor = self._get_neighbors_tensor()
+        self.init_names = (
+            "all zeros",
+            "1 true layer",
+            "2 true layers",
+            "3 true layers",
+            "4 true layers",
+            "5 true layers",
+            "6 true layers",
+            "7 true layers",
+            "8 true layers",
+            "9 true layers",
+            "10 true layers",
+            "11 true layers",
+            "12 true layers",
+            "13 true layers",
+            "random walk",
+            "random",
+            "manhattan",
+            "hamming",
+            "catboost",
+        )
+        self.Y0 = self.init_distances()
 
     @property
     def n_gens(self):
         return len(self.generators)
+
+    @property
+    def state_size(self):
+        return self.available_moves.shape[1]
 
     def _moves2tensor(self):
         moves = get_moves(self.puzzle_type)
@@ -191,81 +152,200 @@ class TensorCube:
             torch.cuda.empty_cache()
         return neighbors_tensor
 
-    def init_distances(self, init_type):
-        cum_sums = self.layers_pop.cumsum()
-        Y0 = torch.zeros((N_STATES,), dtype=torch.int, device=self.device)
-        if isinstance(init_type, int):
-            # assign first several layers by true distance
-            assert init_type < len(cum_sums)
-            Y0[:cum_sums[init_type]] = self.distances[:cum_sums[init_type]]
-        elif isinstance(init_type, list):
-            # assign each layer by a specific value
-            assert len(init_type) == 14
-            for i in range(14):
-                Y0[cum_sums[i]:cum_sums[i + 1]] = init_type[i]
-        elif init_type == "hamming":
-            Y0 = torch.cdist(
-                self.states.to(device=self.device, dtype=torch.float64),
-                self.states[0].unsqueeze(0).to(device=self.device, dtype=torch.float64), p=0
-            ).squeeze() * 14. / 24.
-        elif init_type == "manhattan":
-            norm = torch.linalg.vector_norm((self.states - self.states[0, :].unsqueeze(
-                0)).to(device=self.device, dtype=torch.float64), 1, dim=-1)
-            Y0 = norm * 14. / norm.max()
-        return Y0
-
-    def iterations_to_convergence(self,
-                                  alphas: Iterable[int],
-                                  init_type: int | str | list[int] | None = None,
-                                  eps: float = 1e-5,
-                                  max_iter: int = 1000,
-                                  correlation_func=spearmanr,
-                                  noise_begin: int = N_GOD,
-                                  sigma: float = 1.0,
+    def make_random_walks_dataset(self,
+                                  n_random_walk_length: int,
+                                  n_random_walks_to_generate: int,
+                                  rw_start=None,
                                   verbose: bool = False):
+        '''    
+        Args: 
+            n_random_walk_length - number of visited nodes, i.e. number of steps + 1 
+            n_random_walks_to_generate - how many random walks will run in parrallel
+            rw_start - initial states for random walks - by default we will use 0,1,2,3 ...
+                Can be vector or array
+                If it is vector it will be broadcasted n_random_walks_to_generate times, 
+                If it is array n_random_walks_to_generate - input n_random_walks_to_generate will be ignored
+                and will be assigned: n_random_walks_to_generate = rw_start.shape[0]
+
+        Returns:
+            X, y: np.array, X - array of states, y - number of steps rw achieves it
+        '''
+
+        # Initialize current array of steps with  state_rw_start - expanding (broadcasting) it into array:
+        if rw_start is None:
+            # Starting state for random walks (for train data it is our destination state - "solved puzzle state")
+            state_rw_start = torch.arange(self.state_size, device=self.device)
+            array_of_states = state_rw_start.view(1, self.state_size).expand(
+                n_random_walks_to_generate, self.state_size)
+        else:
+            if len(rw_start.shape) == 1:
+                array_of_states = rw_start.view(1, self.state_size).expand(
+                    n_random_walks_to_generate, self.state_size)
+            else:
+                array_of_states = rw_start
+        if verbose:
+            print('state_rw_start.shape:', state_rw_start.shape)
+            print('state_rw_start:', state_rw_start)
+            print(array_of_states.shape)
+            print(array_of_states[:3, :])
+
+        # Output: X,y - states, y - how many steps we achieve them
+        # Allocate memory:
+        X = torch.zeros(n_random_walks_to_generate *
+                        n_random_walk_length, self.state_size, device=self.device)
+        y = torch.zeros(n_random_walks_to_generate *
+                        n_random_walk_length, device=self.device)
+        if verbose:
+            print('X.shape', X.shape)
+
+        # First portion of data  - just our state_rw_start state  multiplexed many times
+        X[:n_random_walks_to_generate, :] = array_of_states
+        y[:n_random_walks_to_generate] = 0
+
+        # Technical to make array[ IX_array] we need  actually to write array[ range(N), IX_array  ]
+        row_indices = torch.arange(
+            array_of_states.shape[0], device=self.device)
+        row_indices = np.arange(array_of_states.shape[0])[:, np.newaxis]
+
+        # Main loop
+        for i_step in range(1, n_random_walk_length):
+            y[(i_step)*n_random_walks_to_generate: (i_step+1)
+              * n_random_walks_to_generate] = i_step
+            IX_moves = np.random.randint(
+                0, self.n_gens, size=n_random_walks_to_generate, dtype=int)  # random moves indixes
+            # all_moves[IX_moves,:] ]
+            new_array_of_states = array_of_states[row_indices,
+                                                  self.available_moves[IX_moves, :]]
+            array_of_states = new_array_of_states
+            X[(i_step)*n_random_walks_to_generate: (i_step+1) *
+              n_random_walks_to_generate, :] = new_array_of_states
+
+        if verbose:
+            print(array_of_states.shape, 'array_of_states.shape')
+            print(n_random_walk_length, 'n_random_walk_length',
+                  self.state_size, 'state_size', '')
+            print('Finished')
+            print(str(X)[:500])
+            print(str(y)[:500])
+
+        return X, y
+
+    def cat_boost_init(self, X, y: np.array, verbose: bool = True):
+        start_time = time()
+        if verbose:
+            print("Starting catboost init...")
+        model = CatBoostRegressor(verbose=False)
+        model.fit(X, y)
+        if verbose:
+            y_pred = model.predict(X)
+            r2_train = r2_score(y, y_pred)
+            print(f"Train R^2 score: {r2_train:.2f}")
+        result = model.predict(self.states.cpu().numpy())
+        if verbose:
+            print(f"Catboost init took {time() - start_time:.2f} s")
+        return torch.tensor(result, device=self.device)
+
+    def init_distances(self):
+        """
+        Return variants of distance initializations:
+        - all zeros
+        - true distaces for first k layers, k=1,..,13
+        - Manhattan distance to target
+        - Hamming distance to target
+        - random walks initialization
+        - random value for each layer
+        """
+        RW_DIST = [1, 2, 3, 4, 5, 7, 10, 14, 18, 29, 65, 216, 385, 478]
+        cum_sums = self.layers_pop.cumsum()
+        Y = torch.zeros((len(self.init_names), N_STATES),
+                        dtype=torch.float64, device=self.device)
+        for k in range(1, 14):
+            Y[k, :cum_sums[k]] = self.distances[:cum_sums[k]]
+            Y[14, :cum_sums[k]] = RW_DIST[k]
+            Y[15, :cum_sums[k]] = np.random.randint(15)
+        norm = torch.linalg.vector_norm((self.states - self.states[0, :].unsqueeze(0)).to(
+            device=self.device, dtype=torch.float64), 1, dim=-1)
+        Y[16, :] = norm * 14. / norm.max()
+        Y[17, :] = torch.cdist(self.states.to(device=self.device, dtype=torch.float64),
+                               self.states[0].unsqueeze(0).to(
+                                   device=self.device, dtype=torch.float64),
+                               p=0).squeeze() * 14. / 24.
+        X, y = self.make_random_walks_dataset(15, 100_000)
+        Y[18, :] = self.cat_boost_init(X.cpu().numpy(), y.cpu().numpy())
+        return Y
+
+    def convergence_stats(self,
+                          args: Iterable[int | float],
+                          vs_alpha: bool = True,
+                          eps: float = 1e-5,
+                          max_iter: int = 1000,
+                          sigma: float = 1.0,
+                          verbose: bool = False):
         """
         Finds number of iterations and correlations on each iteration of DP algorithm
 
         Args:
-            alphas: list of floats from (0, 1]
-            init_type: specifies the initial values of distances (None = zero init)
+            vs_alpha: bool, if true, collects stats vs alphas, otherwise vs noise begins
+            args: list of alphas (floats from (0, 1]) or noise begins (range(N_GOD))
             eps: float, tolerance
             max_iter: int, maximum number of iterations
-            correlation_func: Callable, function which calculate correlation (Pearson or Spearman)
-            noise_begin: int, layer from which gaussian random noise is added on each iteration (no noise by default)
+            sigma: float, std of gaussian noise
         """
         cum_sums = self.layers_pop.cumsum()
-        Y0 = self.init_distances(init_type)
-        iterations = []
-        correlations = []
-        for alpha in alphas:
-            Y = torch.clone(Y0).to(device=self.device, dtype=torch.float64)
-            Y[cum_sums[noise_begin]:] += torch.normal(torch.zeros(
-                (N_STATES - cum_sums[noise_begin],), dtype=torch.float64, device=self.device), std=sigma)
+        iterations = torch.full(
+            (self.Y0.shape[0], len(args)), max_iter, device=self.device)
+        pearson = torch.full((self.Y0.shape[0], len(
+            args), max_iter), 2.0, device=self.device, dtype=torch.float64)
+        # spearman = torch.zeros((Y0.shape[0], len(alphas), max_iter))
+        true_distances = self.distances.to(
+            device=self.device, dtype=torch.float64)
+        for i, arg in enumerate(args):
+            iteration_begin = time()
+            alpha = arg if vs_alpha else 1.0
+            Y = torch.clone(self.Y0).to(
+                device=self.device, dtype=torch.float64)
+            if not vs_alpha:
+                Y[:, cum_sums[i]:] += torch.normal(
+                    torch.zeros((Y.shape[0], N_STATES - cum_sums[i],),
+                                dtype=torch.float64, device=self.device),
+                    std=sigma)
+
+                Y = torch.clip(Y, 0, N_GOD)
             finish = max_iter
             curr_corr = []
-            if verbose:
-                for i in range(len(cum_sums) - 1):
-                    print(i + 1, torch.norm(Y[cum_sums[i]:cum_sums[i+1]
-                                              ] - self.distances[cum_sums[i]:cum_sums[i+1]]))
             for j in range(max_iter):
+                if verbose:
+                    print(f"Starting iteration {j}...")
+                start = time()
                 Y = (1 - alpha) * Y + alpha * \
-                    (Y[self.neighbors_tensor].min(dim=1)[0] + 1)
-                Y[0] = 0
+                    (Y[:, self.neighbors_tensor].min(dim=-1)[0] + 1)
+                Y[:, 0] = 0
+                if verbose:
+                    print(f"Update took {time() - start:.2f} s")
                 if verbose:
                     for i in range(len(cum_sums) - 1):
-                        print(
-                            i + 1, torch.norm(Y[cum_sums[i]:cum_sums[i+1]] - self.distances[cum_sums[i]:cum_sums[i+1]]))
-                diff = torch.norm(Y - self.distances)
-                curr_corr.append(correlation_func(
-                    Y.cpu(), self.distances.cpu()).statistic)
+                        print(f"  layer {i + 1} error:",
+                              torch.norm(Y[:, cum_sums[i]:cum_sums[i+1]] - true_distances[cum_sums[i]:cum_sums[i+1]], dim=-1).max())
+                diff = torch.norm(Y - self.distances, dim=1)
+                iterations[(iterations[:, i] == max_iter)
+                           & (diff < eps), i] = j + 1
+                pearson[:, i, j] = rowwise_pearson_correlation(
+                    Y, true_distances)
+                # spearman[:, i, j] = rowwise_spearman_correlation(Y, true_distances)
+                # pearson_scipy = []
+                # for idx in range(Y.shape[0]):
+                #     pearson_scipy.append(pearsonr(Y[idx].cpu().numpy(), true_distances.cpu().numpy()).statistic)
+                # corr_diff = np.linalg.norm(pearson_scipy - pearson[:, i, j].cpu().numpy())
+                # if corr_diff > 1e-6:
+                #     print("Too large diff:", corr_diff)
+                # curr_corr.append(spearman(Y.T, torch.tile(self.distances.to(torch.float), (Y.shape[0], 1)).T))
                 if verbose:
-                    print(diff)
-                if diff < eps:
-                    finish = j
+                    print(diff.cpu())
+                if diff.max() < eps:
                     break
-            iterations.append(finish + 1)
-            correlations.append(curr_corr)
-        print(round(alpha, 2), finish, torch.norm(
-            Y - self.distances).cpu().numpy())
-        return iterations, correlations
+                if verbose:
+                    print(f"iteration {j} took {time() - start:.2f} s")
+            print(round(alpha, 2) if vs_alpha else f"noise from layer {i}",
+                  torch.norm(Y - self.distances).cpu().numpy(),
+                  f"took {time() - iteration_begin:.2f} s")
+        return iterations.cpu().numpy(), pearson.cpu().numpy()
